@@ -1,9 +1,9 @@
 name: Flight price check
 
 on:
-  schedule:
-    # Every 30 minutes. GitHub cron is best-effort; expect 5-15 min jitter.
-    - cron: "*/30 * * * *"
+  # Triggered by cron-job.org via workflow_dispatch on a 30-min schedule.
+  # GitHub's native schedule trigger is intentionally not used — it was
+  # unreliable (multi-hour delays on free public repos).
   workflow_dispatch: {}
 
 permissions:
