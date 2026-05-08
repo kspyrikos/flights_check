@@ -1,0 +1,202 @@
+"""Apollorejser.dk flight price watcher.
+
+Opens each candidate departure date in a headless Chromium, scrapes the
+lowest plausible DKK price visible, and emails the configured recipient
+via Gmail SMTP if any price drops below THRESHOLD_DKK. Sender, app
+password, and recipient are read from env vars (GMAIL_USER,
+GMAIL_APP_PASSWORD, EMAIL_TO) so no addresses live in the repo.
+
+State is persisted in state.json so the same low price isn't emailed on
+every run; we only re-alert when the price goes lower than what we last
+alerted for that date, or after a price has recovered above the
+threshold and dropped again.
+"""
+
+import asyncio
+import json
+import os
+import random
+import re
+import smtplib
+import sys
+from email.mime.text import MIMEText
+from pathlib import Path
+
+from playwright.async_api import async_playwright
+
+DATES = [
+    (
+        "2026-08-01",
+        "https://www.apollorejser.dk/booking-guide/flight/list?departureAirportCode=CPH&travelAreaUri=der%3Aairport%3Adtno%3A1206265&paxAges=18&searchProductCategoryCodes=TwoWayFlightOnly&departureDate=2026-08-01&endDate=&duration=7&searchType=NotSet&abTestVisualDestinations=true",
+    ),
+    (
+        "2026-08-08",
+        "https://www.apollorejser.dk/booking-guide/flight/list?departureAirportCode=CPH&travelAreaUri=der%3Aairport%3Adtno%3A1206265&paxAges=18&searchProductCategoryCodes=TwoWayFlightOnly&departureDate=2026-08-08&endDate=&duration=7&searchType=NotSet&abTestVisualDestinations=true",
+    ),
+    (
+        "2026-08-15",
+        "https://www.apollorejser.dk/booking-guide/flight/list?departureAirportCode=CPH&travelAreaUri=der%3Aairport%3Adtno%3A1206265&paxAges=18&searchProductCategoryCodes=TwoWayFlightOnly&departureDate=2026-08-15&endDate=&duration=7&searchType=NotSet&abTestVisualDestinations=true",
+    ),
+]
+
+THRESHOLD = int(os.environ.get("THRESHOLD_DKK", "2000"))
+STATE_FILE = Path(__file__).parent / "state.json"
+
+# Matches Danish-formatted prices. Apollorejser uses "2.398,-" (no kr/DKK
+# suffix); we also accept "kr"/"DKK" defensively in case the markup varies.
+PRICE_RE = re.compile(r"(\d{1,2}[.\s]?\d{3}|\d{3,5})\s*(?:,-|kr\.?|DKK)", re.IGNORECASE)
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+
+
+async def fetch_lowest_price(page, url: str) -> int | None:
+    await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+
+    # Cookie banner — Apollorejser uses Cookiebot. Try a few variants.
+    for sel in [
+        "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
+        "button:has-text('Tillad alle')",
+        "button:has-text('Acceptér alle')",
+        "button:has-text('Accepter alle')",
+        "button:has-text('OK')",
+    ]:
+        try:
+            await page.locator(sel).first.click(timeout=2_000)
+            break
+        except Exception:
+            continue
+
+    # Let the SPA render results.
+    try:
+        await page.wait_for_load_state("networkidle", timeout=30_000)
+    except Exception:
+        pass
+    await page.wait_for_timeout(4_000)
+
+    # Scroll once in case results lazy-load on intersection.
+    try:
+        await page.mouse.wheel(0, 2_000)
+        await page.wait_for_timeout(2_000)
+    except Exception:
+        pass
+
+    text = await page.evaluate("() => document.body.innerText")
+    prices: list[int] = []
+    for m in PRICE_RE.findall(text):
+        n = int(m.replace(".", "").replace(" ", ""))
+        # Filter to plausible round-trip flight prices.
+        if 500 <= n <= 30_000:
+            prices.append(n)
+    return min(prices) if prices else None
+
+
+async def collect_prices() -> dict[str, int | None]:
+    results: dict[str, int | None] = {}
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(args=["--disable-blink-features=AutomationControlled"])
+        ctx = await browser.new_context(locale="da-DK", user_agent=USER_AGENT)
+        page = await ctx.new_page()
+        for date, url in DATES:
+            try:
+                price = await fetch_lowest_price(page, url)
+            except Exception as exc:
+                print(f"ERROR scraping {date}: {exc}", file=sys.stderr)
+                price = None
+            results[date] = price
+            print(f"{date}: {price}")
+            # Jitter between requests so we don't hammer the site predictably.
+            await page.wait_for_timeout(random.randint(2_000, 6_000))
+        await browser.close()
+    return results
+
+
+def load_state() -> dict[str, int | None]:
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def save_state(state: dict[str, int | None]) -> None:
+    STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+
+def decide_alerts(
+    results: dict[str, int | None],
+    state: dict[str, int | None],
+) -> tuple[list[tuple[str, int]], dict[str, int | None]]:
+    """Return (alerts_to_send, new_state).
+
+    Alert when price < THRESHOLD AND (no prior alert OR new price is lower
+    than the last alerted price). Reset the per-date watermark when price
+    recovers above the threshold so the next dip re-alerts.
+    """
+    alerts: list[tuple[str, int]] = []
+    new_state = dict(state)
+    for date, price in results.items():
+        if price is None:
+            continue
+        last_alerted = state.get(date)
+        if price < THRESHOLD:
+            if last_alerted is None or price < last_alerted:
+                alerts.append((date, price))
+                new_state[date] = price
+        else:
+            if last_alerted is not None:
+                new_state[date] = None
+    return alerts, new_state
+
+
+def send_email(alerts: list[tuple[str, int]], all_results: dict[str, int | None]) -> None:
+    user = os.environ["GMAIL_USER"]
+    pw = os.environ["GMAIL_APP_PASSWORD"]
+    to = os.environ.get("EMAIL_TO", user)
+
+    lowest = min(p for _, p in alerts)
+    lines = [
+        "Flight price alert — apollorejser.dk, CPH round-trip, 7 days.",
+        "",
+        f"Threshold: {THRESHOLD} DKK",
+        "",
+        "Triggered:",
+    ]
+    for date, price in alerts:
+        url = next(u for d, u in DATES if d == date)
+        lines.append(f"  {date}: {price} DKK  ->  {url}")
+    lines.append("")
+    lines.append("All prices this check:")
+    for date, price in all_results.items():
+        shown = f"{price} DKK" if price is not None else "unknown"
+        lines.append(f"  {date}: {shown}")
+
+    msg = MIMEText("\n".join(lines))
+    msg["Subject"] = f"Flight price drop: {lowest} DKK"
+    msg["From"] = user
+    msg["To"] = to
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+        smtp.login(user, pw)
+        smtp.send_message(msg)
+    print(f"Email sent to {to}")
+
+
+async def main() -> int:
+    results = await collect_prices()
+    state = load_state()
+    alerts, new_state = decide_alerts(results, state)
+    save_state(new_state)
+    if alerts:
+        send_email(alerts, results)
+    else:
+        print("No alerts to send.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))
