@@ -2,8 +2,8 @@ name: Flight price check
 
 on:
   schedule:
-    # Every 10 minutes. GitHub may delay this 10-30 min under load.
-    - cron: "*/10 * * * *"
+    # Every 30 minutes. GitHub cron is best-effort; expect 5-15 min jitter.
+    - cron: "*/30 * * * *"
   workflow_dispatch: {}
 
 permissions:
