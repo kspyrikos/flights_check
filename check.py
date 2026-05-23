@@ -24,36 +24,43 @@ from pathlib import Path
 
 from playwright.async_api import async_playwright
 
+# Each tuple: (destination, departure date, search URL, alert threshold in DKK).
 DATES = [
     (
         "Samos",
         "2026-08-01",
         "https://www.apollorejser.dk/booking-guide/flight/list?departureAirportCode=CPH&travelAreaUri=der%3Aairport%3Adtno%3A1206265&paxAges=18&searchProductCategoryCodes=TwoWayFlightOnly&departureDate=2026-08-01&endDate=&duration=7&searchType=NotSet&abTestVisualDestinations=true",
+        2000,
     ),
     (
         "Samos",
         "2026-08-08",
         "https://www.apollorejser.dk/booking-guide/flight/list?departureAirportCode=CPH&travelAreaUri=der%3Aairport%3Adtno%3A1206265&paxAges=18&searchProductCategoryCodes=TwoWayFlightOnly&departureDate=2026-08-08&endDate=&duration=7&searchType=NotSet&abTestVisualDestinations=true",
+        2000,
     ),
     (
         "Samos",
         "2026-08-15",
         "https://www.apollorejser.dk/booking-guide/flight/list?departureAirportCode=CPH&travelAreaUri=der%3Aairport%3Adtno%3A1206265&paxAges=18&searchProductCategoryCodes=TwoWayFlightOnly&departureDate=2026-08-15&endDate=&duration=7&searchType=NotSet&abTestVisualDestinations=true",
+        2000,
     ),
     (
         "Ioannina",
         "2026-08-03",
         "https://www.apollorejser.dk/booking-guide/flight/list?departureAirportCode=CPH&travelAreaUri=der%3Aairport%3Adtno%3A1206225&paxAges=18&searchProductCategoryCodes=TwoWayFlightOnly&departureDate=2026-08-03&duration=7&searchType=NotSet&abTestVisualDestinations=true",
+        2500,
     ),
     (
         "Ioannina",
         "2026-08-10",
         "https://www.apollorejser.dk/booking-guide/flight/list?departureAirportCode=CPH&travelAreaUri=der%3Aairport%3Adtno%3A1206225&paxAges=18&searchProductCategoryCodes=TwoWayFlightOnly&departureDate=2026-08-10&duration=7&searchType=NotSet&abTestVisualDestinations=true",
+        2500,
     ),
     (
         "Ioannina",
         "2026-08-17",
         "https://www.apollorejser.dk/booking-guide/flight/list?departureAirportCode=CPH&travelAreaUri=der%3Aairport%3Adtno%3A1206225&paxAges=18&searchProductCategoryCodes=TwoWayFlightOnly&departureDate=2026-08-17&duration=7&searchType=NotSet&abTestVisualDestinations=true",
+        2500,
     ),
 ]
 
@@ -61,7 +68,18 @@ DATES = [
 def trip_key(destination: str, date: str) -> str:
     return f"{destination} {date}"
 
-THRESHOLD = int(os.environ.get("THRESHOLD_DKK", "2000"))
+
+# Per-trip thresholds. THRESHOLD_DKK env var, if set, overrides all of these
+# (useful for testing the email path — set it to something huge to force alerts).
+THRESHOLDS = {trip_key(dest, date): th for dest, date, _url, th in DATES}
+_OVERRIDE = os.environ.get("THRESHOLD_DKK", "").strip()
+GLOBAL_OVERRIDE: int | None = int(_OVERRIDE) if _OVERRIDE else None
+
+
+def threshold_for(key: str) -> int:
+    return GLOBAL_OVERRIDE if GLOBAL_OVERRIDE is not None else THRESHOLDS[key]
+
+
 STATE_FILE = Path(__file__).parent / "state.json"
 
 # Matches Danish-formatted prices. Apollorejser uses "2.398,-" (no kr/DKK
@@ -122,7 +140,7 @@ async def collect_prices() -> dict[str, int | None]:
         browser = await p.chromium.launch(args=["--disable-blink-features=AutomationControlled"])
         ctx = await browser.new_context(locale="da-DK", user_agent=USER_AGENT)
         page = await ctx.new_page()
-        for destination, date, url in DATES:
+        for destination, date, url, _threshold in DATES:
             key = trip_key(destination, date)
             try:
                 price = await fetch_lowest_price(page, url)
@@ -168,7 +186,8 @@ def decide_alerts(
         if price is None:
             continue
         last_alerted = state.get(key)
-        if price < THRESHOLD:
+        threshold = threshold_for(key)
+        if price < threshold:
             if last_alerted is None or price < last_alerted:
                 alerts.append((key, price))
                 new_state[key] = price
@@ -184,21 +203,22 @@ def send_email(alerts: list[tuple[str, int]], all_results: dict[str, int | None]
     to = os.environ.get("EMAIL_TO", user)
 
     lowest = min(p for _, p in alerts)
+    override_note = f" (overridden to {GLOBAL_OVERRIDE} DKK)" if GLOBAL_OVERRIDE else ""
     lines = [
         "Flight price alert — apollorejser.dk, CPH round-trip, 7 days.",
         "",
-        f"Threshold: {THRESHOLD} DKK",
+        f"Per-trip thresholds active{override_note}.",
         "",
         "Triggered:",
     ]
-    url_by_key = {trip_key(dest, date): url for dest, date, url in DATES}
+    url_by_key = {trip_key(dest, date): url for dest, date, url, _ in DATES}
     for key, price in alerts:
-        lines.append(f"  {key}: {price} DKK  ->  {url_by_key[key]}")
+        lines.append(f"  {key}: {price} DKK (threshold {threshold_for(key)})  ->  {url_by_key[key]}")
     lines.append("")
     lines.append("All prices this check:")
     for key, price in all_results.items():
         shown = f"{price} DKK" if price is not None else "unknown"
-        lines.append(f"  {key}: {shown}")
+        lines.append(f"  {key}: {shown} (threshold {threshold_for(key)})")
 
     msg = MIMEText("\n".join(lines))
     msg["Subject"] = f"Flight price drop: {lowest} DKK"
