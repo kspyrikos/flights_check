@@ -26,18 +26,40 @@ from playwright.async_api import async_playwright
 
 DATES = [
     (
+        "Samos",
         "2026-08-01",
         "https://www.apollorejser.dk/booking-guide/flight/list?departureAirportCode=CPH&travelAreaUri=der%3Aairport%3Adtno%3A1206265&paxAges=18&searchProductCategoryCodes=TwoWayFlightOnly&departureDate=2026-08-01&endDate=&duration=7&searchType=NotSet&abTestVisualDestinations=true",
     ),
     (
+        "Samos",
         "2026-08-08",
         "https://www.apollorejser.dk/booking-guide/flight/list?departureAirportCode=CPH&travelAreaUri=der%3Aairport%3Adtno%3A1206265&paxAges=18&searchProductCategoryCodes=TwoWayFlightOnly&departureDate=2026-08-08&endDate=&duration=7&searchType=NotSet&abTestVisualDestinations=true",
     ),
     (
+        "Samos",
         "2026-08-15",
         "https://www.apollorejser.dk/booking-guide/flight/list?departureAirportCode=CPH&travelAreaUri=der%3Aairport%3Adtno%3A1206265&paxAges=18&searchProductCategoryCodes=TwoWayFlightOnly&departureDate=2026-08-15&endDate=&duration=7&searchType=NotSet&abTestVisualDestinations=true",
     ),
+    (
+        "Ioannina",
+        "2026-08-03",
+        "https://www.apollorejser.dk/booking-guide/flight/list?departureAirportCode=CPH&travelAreaUri=der%3Aairport%3Adtno%3A1206225&paxAges=18&searchProductCategoryCodes=TwoWayFlightOnly&departureDate=2026-08-03&duration=7&searchType=NotSet&abTestVisualDestinations=true",
+    ),
+    (
+        "Ioannina",
+        "2026-08-10",
+        "https://www.apollorejser.dk/booking-guide/flight/list?departureAirportCode=CPH&travelAreaUri=der%3Aairport%3Adtno%3A1206225&paxAges=18&searchProductCategoryCodes=TwoWayFlightOnly&departureDate=2026-08-10&duration=7&searchType=NotSet&abTestVisualDestinations=true",
+    ),
+    (
+        "Ioannina",
+        "2026-08-17",
+        "https://www.apollorejser.dk/booking-guide/flight/list?departureAirportCode=CPH&travelAreaUri=der%3Aairport%3Adtno%3A1206225&paxAges=18&searchProductCategoryCodes=TwoWayFlightOnly&departureDate=2026-08-17&duration=7&searchType=NotSet&abTestVisualDestinations=true",
+    ),
 ]
+
+
+def trip_key(destination: str, date: str) -> str:
+    return f"{destination} {date}"
 
 THRESHOLD = int(os.environ.get("THRESHOLD_DKK", "2000"))
 STATE_FILE = Path(__file__).parent / "state.json"
@@ -100,14 +122,15 @@ async def collect_prices() -> dict[str, int | None]:
         browser = await p.chromium.launch(args=["--disable-blink-features=AutomationControlled"])
         ctx = await browser.new_context(locale="da-DK", user_agent=USER_AGENT)
         page = await ctx.new_page()
-        for date, url in DATES:
+        for destination, date, url in DATES:
+            key = trip_key(destination, date)
             try:
                 price = await fetch_lowest_price(page, url)
             except Exception as exc:
-                print(f"ERROR scraping {date}: {exc}", file=sys.stderr)
+                print(f"ERROR scraping {key}: {exc}", file=sys.stderr)
                 price = None
-            results[date] = price
-            print(f"{date}: {price}")
+            results[key] = price
+            print(f"{key}: {price}")
             # Jitter between requests so we don't hammer the site predictably.
             await page.wait_for_timeout(random.randint(2_000, 6_000))
         await browser.close()
@@ -138,18 +161,20 @@ def decide_alerts(
     recovers above the threshold so the next dip re-alerts.
     """
     alerts: list[tuple[str, int]] = []
-    new_state = dict(state)
-    for date, price in results.items():
+    # Drop any state keys not in this run's results so old trips don't
+    # leave orphaned watermarks in state.json forever.
+    new_state = {k: v for k, v in state.items() if k in results}
+    for key, price in results.items():
         if price is None:
             continue
-        last_alerted = state.get(date)
+        last_alerted = state.get(key)
         if price < THRESHOLD:
             if last_alerted is None or price < last_alerted:
-                alerts.append((date, price))
-                new_state[date] = price
+                alerts.append((key, price))
+                new_state[key] = price
         else:
             if last_alerted is not None:
-                new_state[date] = None
+                new_state[key] = None
     return alerts, new_state
 
 
@@ -166,14 +191,14 @@ def send_email(alerts: list[tuple[str, int]], all_results: dict[str, int | None]
         "",
         "Triggered:",
     ]
-    for date, price in alerts:
-        url = next(u for d, u in DATES if d == date)
-        lines.append(f"  {date}: {price} DKK  ->  {url}")
+    url_by_key = {trip_key(dest, date): url for dest, date, url in DATES}
+    for key, price in alerts:
+        lines.append(f"  {key}: {price} DKK  ->  {url_by_key[key]}")
     lines.append("")
     lines.append("All prices this check:")
-    for date, price in all_results.items():
+    for key, price in all_results.items():
         shown = f"{price} DKK" if price is not None else "unknown"
-        lines.append(f"  {date}: {shown}")
+        lines.append(f"  {key}: {shown}")
 
     msg = MIMEText("\n".join(lines))
     msg["Subject"] = f"Flight price drop: {lowest} DKK"
